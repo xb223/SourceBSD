@@ -1,0 +1,172 @@
+#!/bin/sh
+# srcwatch - SourceBSD behavioral anomaly detector
+
+WATCH_DIR="/var/db/srcwatch"
+LOG_FILE="/var/log/srcwatch.log"
+
+mkdir -p $WATCH_DIR
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+case "$1" in
+  start)
+    echo "==================================="
+    echo " SourceBSD - srcwatch starting"
+    echo "==================================="
+
+    if [ -f "$WATCH_DIR/srcwatch.pid" ]; then
+      echo "srcwatch is already running."
+      exit 1
+    fi
+
+    echo "Building baselines for all jails..."
+
+    # baseline each jail
+    for POLICY in /etc/srcbsd/policies/*.policy; do
+      [ -f "$POLICY" ] || continue
+      JAIL_NAME=$(basename $POLICY .policy)
+      BASELINE="$WATCH_DIR/$JAIL_NAME.baseline"
+
+      echo "  Baselining jail: $JAIL_NAME"
+
+      # record baseline metrics
+      cat > $BASELINE << BASEEOF
+jail=$JAIL_NAME
+baseline_cpu=$(ps aux | awk '{sum+=$3} END {print sum}')
+baseline_mem=$(vmstat | tail -1 | awk '{print $4}')
+baseline_time=$(date +%s)
+connections=$(netstat -an | grep ESTABLISHED | wc -l | tr -d ' ')
+BASEEOF
+
+      log "INFO  Baseline created for jail:$JAIL_NAME"
+    done
+
+    echo $$ > $WATCH_DIR/srcwatch.pid
+    log "INFO  srcwatch started — monitoring $(ls /etc/srcbsd/policies/*.policy 2>/dev/null | wc -l | tr -d ' ') jails"
+
+    echo ""
+    echo "srcwatch is running."
+    echo "Log: $LOG_FILE"
+    echo "Use: srcwatch tail    to see live alerts"
+    echo "Use: srcwatch score   to check anomaly scores"
+    ;;
+
+  stop)
+    if [ -f "$WATCH_DIR/srcwatch.pid" ]; then
+      rm -f $WATCH_DIR/srcwatch.pid
+      log "INFO  srcwatch stopped"
+      echo "srcwatch stopped."
+    else
+      echo "srcwatch is not running."
+    fi
+    ;;
+
+  tail)
+    echo "==================================="
+    echo " SourceBSD - Live Anomaly Stream"
+    echo "==================================="
+    if [ -f "$LOG_FILE" ]; then
+      tail -f $LOG_FILE
+    else
+      echo "No log file yet. Run: srcwatch start"
+    fi
+    ;;
+
+  score)
+    echo "==================================="
+    echo " SourceBSD - Anomaly Scores"
+    echo "==================================="
+    echo ""
+
+    for POLICY in /etc/srcbsd/policies/*.policy; do
+      [ -f "$POLICY" ] || continue
+      JAIL_NAME=$(basename $POLICY .policy)
+      BASELINE="$WATCH_DIR/$JAIL_NAME.baseline"
+
+      # calculate a live score vs baseline
+      CURRENT_CPU=$(ps aux | awk '{sum+=$3} END {print int(sum)}')
+      CURRENT_MEM=$(vmstat | tail -1 | awk '{print $4}')
+      CURRENT_CONNS=$(netstat -an | grep ESTABLISHED | wc -l | tr -d ' ')
+
+      # simple scoring — compare against baseline
+      SCORE=0
+      if [ -f "$BASELINE" ]; then
+        BASE_CPU=$(grep baseline_cpu $BASELINE | cut -d= -f2 | cut -d. -f1)
+        BASE_CONNS=$(grep connections $BASELINE | cut -d= -f2)
+
+        # cpu deviation
+        CPU_DIFF=$(( CURRENT_CPU - ${BASE_CPU:-0} ))
+        if [ "$CPU_DIFF" -gt 50 ] 2>/dev/null; then SCORE=$(( SCORE + 40 )); fi
+        if [ "$CPU_DIFF" -gt 20 ] 2>/dev/null; then SCORE=$(( SCORE + 20 )); fi
+
+        # connection deviation
+        CONN_DIFF=$(( CURRENT_CONNS - ${BASE_CONNS:-0} ))
+        if [ "$CONN_DIFF" -gt 50 ] 2>/dev/null; then SCORE=$(( SCORE + 30 )); fi
+        if [ "$CONN_DIFF" -gt 20 ] 2>/dev/null; then SCORE=$(( SCORE + 10 )); fi
+      else
+        echo "  jail:$JAIL_NAME — no baseline yet, run: srcwatch start"
+        continue
+      fi
+
+      # score label
+      if [ "$SCORE" -gt 65 ]; then
+        LABEL="[CRITICAL]"
+      elif [ "$SCORE" -gt 40 ]; then
+        LABEL="[WARNING] "
+      else
+        LABEL="[OK]      "
+      fi
+
+      echo "  $LABEL jail:$JAIL_NAME — score: $SCORE/100"
+      echo "           CPU: ${CURRENT_CPU}% | Connections: $CURRENT_CONNS"
+      echo ""
+
+      # log if anomaly
+      if [ "$SCORE" -gt 40 ]; then
+        log "WARN  jail:$JAIL_NAME anomaly score $SCORE — CPU:${CURRENT_CPU}% CONNS:$CURRENT_CONNS"
+      fi
+    done
+    echo "==================================="
+    ;;
+
+  check)
+    if [ -z "$2" ]; then
+      echo "Usage: srcwatch check <jailname>"
+      exit 1
+    fi
+    JAIL_NAME="$2"
+    BASELINE="$WATCH_DIR/$JAIL_NAME.baseline"
+
+    echo "==================================="
+    echo " srcwatch — jail:$JAIL_NAME"
+    echo "==================================="
+
+    if [ ! -f "$BASELINE" ]; then
+      echo "No baseline found. Run: srcwatch start"
+      exit 1
+    fi
+
+    echo "Baseline info:"
+    cat $BASELINE
+    echo ""
+    echo "Current:"
+    echo "  CPU:  $(ps aux | awk '{sum+=$3} END {print sum}')%"
+    echo "  MEM:  $(vmstat | tail -1 | awk '{print $4}') free"
+    echo "  CONN: $(netstat -an | grep ESTABLISHED | wc -l | tr -d ' ') established"
+    echo "==================================="
+    ;;
+
+  *)
+    echo "Usage: srcwatch [start|stop|tail|score|check]"
+    echo ""
+    echo "Commands:"
+    echo "  start         Start monitoring and build baselines"
+    echo "  stop          Stop srcwatch"
+    echo "  tail          Stream live anomaly log"
+    echo "  score         Show anomaly scores for all jails"
+    echo "  check <jail>  Show detailed info for one jail"
+    ;;
+esac
