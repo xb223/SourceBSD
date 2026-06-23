@@ -1,0 +1,154 @@
+#!/bin/sh
+# srcaudit - SourceBSD network exposure and security audit
+
+LOG_FILE="/var/log/srcaudit.log"
+POLICY_DIR="/etc/srcbsd/policies"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+case "$1" in
+  expose)
+    echo "==================================="
+    echo " SourceBSD - Network Exposure Audit"
+    echo "==================================="
+    echo ""
+    echo "Scanning open ports..."
+    echo ""
+
+    sockstat -l 2>/dev/null | tail -n +2 | while read USER CMD PID FD PROTO LOCAL REMOTE; do
+      PORT=$(echo $LOCAL | rev | cut -d. -f1 | rev)
+      ADDR=$(echo $LOCAL | rev | cut -d. -f2- | rev)
+
+      case "$ADDR" in
+        *0.0.0.0*|*\**|*::*) EXPOSURE="internet-facing"; TAG="[EXPOSED]" ;;
+        *) EXPOSURE="local-only"; TAG="[LOCAL]  " ;;
+      esac
+
+      case "$PORT" in
+        22)   NOTE="EXPECTED  - SSH" ;;
+        80)   NOTE="EXPECTED  - HTTP" ;;
+        443)  NOTE="EXPECTED  - HTTPS" ;;
+        5432) NOTE="UNEXPECTED - database public" ;;
+        3306) NOTE="UNEXPECTED - database public" ;;
+        6379) NOTE="UNEXPECTED - cache public" ;;
+        *)    NOTE="REVIEW - verify intentional" ;;
+      esac
+
+      echo "  $TAG :$PORT $EXPOSURE — $NOTE"
+    done
+
+    echo ""
+    echo "==================================="
+    echo " Review UNEXPECTED and REVIEW entries"
+    echo "==================================="
+    ;;
+
+  check)
+    echo "==================================="
+    echo " SourceBSD - Security Audit"
+    echo "==================================="
+    echo ""
+    ISSUES=0
+
+    echo "[ Kernel hardening ]"
+
+    SECURELEVEL=$(sysctl -n kern.securelevel)
+    if [ "$SECURELEVEL" -lt 1 ]; then
+      echo "  [WARN] kern.securelevel is $SECURELEVEL — recommend 1 or higher"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.securelevel = $SECURELEVEL"
+    fi
+
+    COREDUMP=$(sysctl -n kern.coredump)
+    if [ "$COREDUMP" = "1" ]; then
+      echo "  [WARN] kern.coredump enabled — may leak sensitive data"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.coredump = $COREDUMP"
+    fi
+
+    echo ""
+    echo "[ SSH hardening ]"
+
+    ROOT_LOGIN=$(grep "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    if [ "$ROOT_LOGIN" = "yes" ]; then
+      echo "  [WARN] PermitRootLogin is yes — disable for production"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   PermitRootLogin = ${ROOT_LOGIN:-default}"
+    fi
+
+    PASS_AUTH=$(grep "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    if [ "$PASS_AUTH" = "yes" ]; then
+      echo "  [WARN] PasswordAuthentication is yes — use keys only"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   PasswordAuthentication = ${PASS_AUTH:-default}"
+    fi
+
+    echo ""
+    echo "[ Jail security ]"
+
+    for POLICY in $POLICY_DIR/*.policy; do
+      [ -f "$POLICY" ] || continue
+      JAIL_NAME=$(basename $POLICY .policy)
+      VEIL="no"
+      [ -f "/var/db/srcveil/$JAIL_NAME.veil" ] && VEIL="yes"
+      BACKUP=$(ls /var/backups/srcbsd/${JAIL_NAME}_*.manifest 2>/dev/null | wc -l | tr -d ' ')
+      TESTED=$(grep -l "test_result=PASSED" /var/backups/srcbsd/${JAIL_NAME}_*.manifest 2>/dev/null | wc -l | tr -d ' ')
+
+      echo ""
+      echo "  jail:$JAIL_NAME"
+
+      if [ "$VEIL" = "yes" ]; then
+        echo "    [OK]   srcveil applied"
+      else
+        echo "    [WARN] srcveil not applied"
+        ISSUES=$(( ISSUES + 1 ))
+      fi
+
+      if [ "$BACKUP" -gt 0 ] && [ "$TESTED" -gt 0 ]; then
+        echo "    [OK]   backup verified"
+      elif [ "$BACKUP" -gt 0 ]; then
+        echo "    [WARN] backup not tested — run: srcbackup test $JAIL_NAME"
+        ISSUES=$(( ISSUES + 1 ))
+      else
+        echo "    [WARN] no backup found — run: srcbackup backup $JAIL_NAME"
+        ISSUES=$(( ISSUES + 1 ))
+      fi
+    done
+
+    echo ""
+    echo "==================================="
+    if [ "$ISSUES" -eq 0 ]; then
+      echo " Result: PASSED — no issues found"
+    else
+      echo " Result: $ISSUES issue(s) found"
+    fi
+    echo "==================================="
+    ;;
+
+  tail)
+    echo "==================================="
+    echo " SourceBSD - Live Audit Log"
+    echo "==================================="
+    if [ -f "$LOG_FILE" ]; then
+      tail -f $LOG_FILE
+    else
+      echo "No audit log yet."
+    fi
+    ;;
+
+  *)
+    echo "Usage: srcaudit [expose|check|tail]"
+    echo ""
+    echo "Commands:"
+    echo "  expose   Show all open ports and exposure status"
+    echo "  check    Full security audit of host and jails"
+    echo "  tail     Stream live audit log"
+    ;;
+esac
