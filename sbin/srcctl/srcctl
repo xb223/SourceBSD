@@ -1,0 +1,37 @@
+#!/bin/sh
+# srcctl - SourceBSD unified control CLI
+
+case "$1" in
+  status)
+    echo "==================================="
+    echo " SourceBSD System Status"
+    echo "==================================="
+    echo ""
+    echo "[ Jails ]"
+    jls -v 2>/dev/null || echo "  No jails running"
+    echo ""
+    echo "[ CPU ]"
+    sysctl -n hw.ncpu | xargs -I% echo "  Cores: %"
+    top -b -d1 | grep "CPU:" | head -1
+    echo ""
+    echo "[ Memory ]"
+    vmstat -h | tail -1
+    echo ""
+    echo "[ Disk ]"
+    df -h | grep -v tmpfs
+    echo ""
+    echo "[ Network ]"
+    netstat -in | grep -v lo0
+    echo ""
+    echo "[ Security ]"
+    echo "  Securelevel: $(sysctl -n kern.securelevel)"
+    echo "  Jails restricted: $(sysctl -n security.jail.enforce_statfs)"
+    echo "==================================="
+    ;;
+  *)
+    echo "Usage: srcctl [status]"
+    echo ""
+    echo "Commands:"
+    echo "  status   Show full system health"
+    ;;
+esac
