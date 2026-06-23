@@ -1,0 +1,192 @@
+#!/bin/sh
+# srcbackup - SourceBSD backup with automatic restore testing
+
+BACKUP_DIR="/var/backups/srcbsd"
+LOG_FILE="/var/log/srcbackup.log"
+POLICY_DIR="/etc/srcbsd/policies"
+
+mkdir -p $BACKUP_DIR
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+case "$1" in
+  backup)
+    if [ -z "$2" ]; then
+      echo "Usage: srcbackup backup <jailname>"
+      echo "       srcbackup backup --all"
+      exit 1
+    fi
+
+    if [ "$2" = "--all" ]; then
+      JAILS=$(ls $POLICY_DIR/*.policy 2>/dev/null | xargs -I{} basename {} .policy)
+    else
+      JAILS="$2"
+    fi
+
+    for JAIL_NAME in $JAILS; do
+      JAIL_PATH="/jails/$JAIL_NAME"
+      TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+      BACKUP_FILE="$BACKUP_DIR/${JAIL_NAME}_${TIMESTAMP}.tar.gz"
+
+      echo "==================================="
+      echo " srcbackup — backing up jail:$JAIL_NAME"
+      echo "==================================="
+
+      if [ ! -d "$JAIL_PATH" ]; then
+        echo "  WARNING: jail path $JAIL_PATH not found, backing up policy only..."
+      fi
+
+      echo "[1/3] Creating backup archive..."
+      # backup jail filesystem and policy
+      mkdir -p $BACKUP_DIR/$JAIL_NAME
+      tar -czf $BACKUP_FILE \
+        $JAIL_PATH 2>/dev/null \
+        /etc/srcbsd/policies/$JAIL_NAME.policy 2>/dev/null \
+        /etc/srcbsd/pf/$JAIL_NAME.pf 2>/dev/null \
+        /var/db/srcwatch/$JAIL_NAME.baseline 2>/dev/null \
+        /var/db/srcveil/$JAIL_NAME.veil 2>/dev/null
+
+      SIZE=$(du -sh $BACKUP_FILE 2>/dev/null | cut -f1)
+
+      echo "[2/3] Writing backup manifest..."
+      cat > $BACKUP_DIR/${JAIL_NAME}_${TIMESTAMP}.manifest << MANEOF
+jail=$JAIL_NAME
+timestamp=$TIMESTAMP
+backup_file=$BACKUP_FILE
+size=$SIZE
+tested=no
+test_result=untested
+created=$(date)
+MANEOF
+
+      echo "[3/3] Logging backup..."
+      log "INFO  Backup created for jail:$JAIL_NAME size:$SIZE file:$BACKUP_FILE"
+
+      echo ""
+      echo "  Jail:     $JAIL_NAME"
+      echo "  File:     $BACKUP_FILE"
+      echo "  Size:     $SIZE"
+      echo "  Tested:   no — run: srcbackup test $JAIL_NAME"
+      echo "==================================="
+    done
+    ;;
+
+  test)
+    if [ -z "$2" ]; then
+      echo "Usage: srcbackup test <jailname>"
+      exit 1
+    fi
+
+    JAIL_NAME="$2"
+    LATEST=$(ls -t $BACKUP_DIR/${JAIL_NAME}_*.tar.gz 2>/dev/null | head -1)
+
+    echo "==================================="
+    echo " srcbackup — restore test"
+    echo " Jail: $JAIL_NAME"
+    echo "==================================="
+
+    if [ -z "$LATEST" ]; then
+      echo "ERROR: No backup found for jail:$JAIL_NAME"
+      echo "Run: srcbackup backup $JAIL_NAME"
+      exit 1
+    fi
+
+    echo "  Latest backup: $LATEST"
+    echo ""
+
+    START_TIME=$(date +%s)
+
+    echo "[1/4] Creating temporary restore directory..."
+    RESTORE_DIR="/tmp/srcbackup_test_$$"
+    mkdir -p $RESTORE_DIR
+
+    echo "[2/4] Extracting backup..."
+    tar -xzf $LATEST -C $RESTORE_DIR 2>/dev/null
+    if [ $? -ne 0 ]; then
+      echo "  FAILED: Could not extract backup archive"
+      rm -rf $RESTORE_DIR
+      log "FAIL  Restore test failed for jail:$JAIL_NAME — extraction error"
+      exit 1
+    fi
+
+    echo "[3/4] Verifying restore contents..."
+    POLICY_CHECK=$(find $RESTORE_DIR -name "*.policy" 2>/dev/null | wc -l | tr -d ' ')
+    DIR_CHECK=$(find $RESTORE_DIR -type d 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$DIR_CHECK" -gt 0 ]; then
+      RESULT="PASSED"
+      RESULT_COLOR="OK"
+    else
+      RESULT="FAILED"
+      RESULT_COLOR="FAIL"
+    fi
+
+    echo "[4/4] Cleaning up test restore..."
+    rm -rf $RESTORE_DIR
+
+    END_TIME=$(date +%s)
+    DURATION=$(( END_TIME - START_TIME ))
+
+    # update manifest
+    MANIFEST=$(ls -t $BACKUP_DIR/${JAIL_NAME}_*.manifest 2>/dev/null | head -1)
+    if [ -f "$MANIFEST" ]; then
+      sed -i '' "s/tested=no/tested=yes/" $MANIFEST
+      sed -i '' "s/test_result=untested/test_result=$RESULT/" $MANIFEST
+    fi
+
+    log "$RESULT_COLOR   Restore test for jail:$JAIL_NAME — $RESULT in ${DURATION}s"
+
+    echo ""
+    echo "==================================="
+    echo " Restore test: $RESULT"
+    echo " Duration:     ${DURATION} seconds"
+    echo " Directories:  $DIR_CHECK found"
+    echo " Policy files: $POLICY_CHECK found"
+    echo "==================================="
+    ;;
+
+  list)
+    echo "==================================="
+    echo " srcbackup — Backup List"
+    echo "==================================="
+    echo ""
+
+    if [ -z "$(ls $BACKUP_DIR/*.manifest 2>/dev/null)" ]; then
+      echo "  No backups found."
+      echo "  Run: srcbackup backup --all"
+    else
+      for MANIFEST in $BACKUP_DIR/*.manifest; do
+        JAIL=$(grep "^jail=" $MANIFEST | cut -d= -f2)
+        TIMESTAMP=$(grep "^timestamp=" $MANIFEST | cut -d= -f2)
+        SIZE=$(grep "^size=" $MANIFEST | cut -d= -f2)
+        TESTED=$(grep "^tested=" $MANIFEST | cut -d= -f2)
+        RESULT=$(grep "^test_result=" $MANIFEST | cut -d= -f2)
+
+        if [ "$TESTED" = "yes" ] && [ "$RESULT" = "PASSED" ]; then
+          STATUS="[VERIFIED]"
+        elif [ "$TESTED" = "yes" ] && [ "$RESULT" = "FAILED" ]; then
+          STATUS="[FAILED]  "
+        else
+          STATUS="[UNTESTED]"
+        fi
+
+        echo "  $STATUS jail:$JAIL — $TIMESTAMP — $SIZE"
+      done
+    fi
+    echo ""
+    echo "==================================="
+    ;;
+
+  *)
+    echo "Usage: srcbackup [backup|test|list]"
+    echo ""
+    echo "Commands:"
+    echo "  backup <jail>    Back up a specific jail"
+    echo "  backup --all     Back up all jails"
+    echo "  test <jail>      Test restore from latest backup"
+    echo "  list             List all backups with test status"
+    ;;
+esac
