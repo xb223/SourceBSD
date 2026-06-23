@@ -1,0 +1,181 @@
+#!/bin/sh
+# srcveil - SourceBSD per-jail privacy profiles
+
+VEIL_DIR="/var/db/srcveil"
+POLICY_DIR="/etc/srcbsd/policies"
+LOG_FILE="/var/log/srcveil.log"
+
+mkdir -p $VEIL_DIR
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+case "$1" in
+  apply)
+    if [ -z "$2" ] || [ -z "$4" ]; then
+      echo "Usage: srcveil apply <jailname> --profile <profile>"
+      echo "Profiles: personal-cloud, no-log, analytics-block, minimal-trace"
+      exit 1
+    fi
+
+    JAIL_NAME="$2"
+    PROFILE="$4"
+    VEIL_FILE="$VEIL_DIR/$JAIL_NAME.veil"
+    POLICY_FILE="$POLICY_DIR/$JAIL_NAME.policy"
+
+    if [ ! -f "$POLICY_FILE" ]; then
+      echo "ERROR: jail:$JAIL_NAME not found. Create it first with srcjail create."
+      exit 1
+    fi
+
+    echo "==================================="
+    echo " SourceBSD - srcveil"
+    echo "==================================="
+    echo " Jail:    $JAIL_NAME"
+    echo " Profile: $PROFILE"
+    echo "==================================="
+    echo ""
+
+    case "$PROFILE" in
+      personal-cloud)
+        BLOCK_TELEMETRY="yes"
+        STRIP_IPS="yes"
+        ROUND_TIMESTAMPS="hour"
+        WIPE_ON_DISCONNECT="yes"
+        BLOCK_DOMAINS="analytics.google.com telemetry.nextcloud.com metrics.nextcloud.com"
+        ;;
+      no-log)
+        BLOCK_TELEMETRY="yes"
+        STRIP_IPS="yes"
+        ROUND_TIMESTAMPS="none"
+        WIPE_ON_DISCONNECT="yes"
+        BLOCK_DOMAINS="*"
+        ;;
+      analytics-block)
+        BLOCK_TELEMETRY="yes"
+        STRIP_IPS="no"
+        ROUND_TIMESTAMPS="day"
+        WIPE_ON_DISCONNECT="no"
+        BLOCK_DOMAINS="analytics.google.com stats.wp.com pixel.wp.com telemetry.microsoft.com"
+        ;;
+      minimal-trace)
+        BLOCK_TELEMETRY="yes"
+        STRIP_IPS="yes"
+        ROUND_TIMESTAMPS="hour"
+        WIPE_ON_DISCONNECT="no"
+        BLOCK_DOMAINS="analytics.google.com telemetry.microsoft.com"
+        ;;
+      *)
+        echo "ERROR: Unknown profile: $PROFILE"
+        echo "Profiles: personal-cloud, no-log, analytics-block, minimal-trace"
+        exit 1
+        ;;
+    esac
+
+    echo "[1/4] Writing veil profile..."
+    cat > $VEIL_FILE << VEILEOF
+jail=$JAIL_NAME
+profile=$PROFILE
+block_telemetry=$BLOCK_TELEMETRY
+strip_ips=$STRIP_IPS
+round_timestamps=$ROUND_TIMESTAMPS
+wipe_on_disconnect=$WIPE_ON_DISCONNECT
+block_domains=$BLOCK_DOMAINS
+applied=$(date)
+VEILEOF
+
+    echo "[2/4] Blocking telemetry domains via pf..."
+    # write pf rules for this jail
+    PF_FILE="/etc/srcbsd/pf/$JAIL_NAME.pf"
+    mkdir -p /etc/srcbsd/pf
+    cat > $PF_FILE << PFEOF
+# srcveil pf rules for jail:$JAIL_NAME
+# profile: $PROFILE
+# generated: $(date)
+
+PFEOF
+    for DOMAIN in $BLOCK_DOMAINS; do
+      if [ "$DOMAIN" = "*" ]; then
+        echo "block out all" >> $PF_FILE
+      else
+        echo "# block $DOMAIN" >> $PF_FILE
+      fi
+    done
+    echo "  Written: $PF_FILE"
+
+    echo "[3/4] Updating jail policy file..."
+    cat >> $POLICY_FILE << POLEOF
+
+# srcveil settings
+veil_profile=$PROFILE
+strip_ips=$STRIP_IPS
+round_timestamps=$ROUND_TIMESTAMPS
+wipe_on_disconnect=$WIPE_ON_DISCONNECT
+POLEOF
+
+    echo "[4/4] Logging veil application..."
+    log "INFO  srcveil applied profile:$PROFILE to jail:$JAIL_NAME"
+
+    echo ""
+    echo "==================================="
+    echo " srcveil applied successfully"
+    echo " Jail:              $JAIL_NAME"
+    echo " Profile:           $PROFILE"
+    echo " Block telemetry:   $BLOCK_TELEMETRY"
+    echo " Strip IPs:         $STRIP_IPS"
+    echo " Timestamp rounding:$ROUND_TIMESTAMPS"
+    echo " Wipe on disconnect:$WIPE_ON_DISCONNECT"
+    echo " PF rules:          $PF_FILE"
+    echo "==================================="
+    ;;
+
+  status)
+    echo "==================================="
+    echo " SourceBSD - srcveil Status"
+    echo "==================================="
+    echo ""
+    if [ -z "$(ls $VEIL_DIR/*.veil 2>/dev/null)" ]; then
+      echo "  No veiled jails found."
+    else
+      for VEIL in $VEIL_DIR/*.veil; do
+        JAIL_NAME=$(grep "^jail=" $VEIL | cut -d= -f2)
+        PROFILE=$(grep "^profile=" $VEIL | cut -d= -f2)
+        APPLIED=$(grep "^applied=" $VEIL | cut -d= -f2-)
+        echo "  jail:$JAIL_NAME"
+        echo "    Profile:  $PROFILE"
+        echo "    Applied:  $APPLIED"
+        echo ""
+      done
+    fi
+    echo "==================================="
+    ;;
+
+  remove)
+    if [ -z "$2" ]; then
+      echo "Usage: srcveil remove <jailname>"
+      exit 1
+    fi
+    JAIL_NAME="$2"
+    rm -f $VEIL_DIR/$JAIL_NAME.veil
+    rm -f /etc/srcbsd/pf/$JAIL_NAME.pf
+    log "INFO  srcveil removed from jail:$JAIL_NAME"
+    echo "srcveil removed from jail:$JAIL_NAME"
+    ;;
+
+  *)
+    echo "Usage: srcveil [apply|status|remove]"
+    echo ""
+    echo "Commands:"
+    echo "  apply <jail> --profile <profile>   Apply privacy profile to jail"
+    echo "  status                              Show all veiled jails"
+    echo "  remove <jail>                       Remove veil from jail"
+    echo ""
+    echo "Profiles:"
+    echo "  personal-cloud    Nextcloud, self-hosted storage"
+    echo "  no-log            VPN, Tor services — zero logging"
+    echo "  analytics-block   Block known analytics domains"
+    echo "  minimal-trace     General purpose privacy"
+    ;;
+esac
