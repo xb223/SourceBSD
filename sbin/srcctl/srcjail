@@ -1,0 +1,162 @@
+#!/bin/sh
+# srcjail - SourceBSD jail management command
+
+JAIL_BASE="/jails"
+JAIL_CONF="/etc/jail.conf"
+
+case "$1" in
+  create)
+    if [ -z "$2" ]; then
+      echo "Usage: srcjail create <name> --profile <profile>"
+      echo "Profiles: web, database, cache, bastion"
+      exit 1
+    fi
+
+    JAIL_NAME="$2"
+    PROFILE="default"
+
+    # check for --profile flag
+    if [ "$3" = "--profile" ] && [ -n "$4" ]; then
+      PROFILE="$4"
+    fi
+
+    echo "==================================="
+    echo " SourceBSD - Creating Jail"
+    echo "==================================="
+    echo " Name:    $JAIL_NAME"
+    echo " Profile: $PROFILE"
+    echo "==================================="
+    echo ""
+
+    # create jail directory
+    echo "[1/5] Creating jail filesystem..."
+    mkdir -p $JAIL_BASE/$JAIL_NAME
+    if [ $? -ne 0 ]; then
+      echo "ERROR: Failed to create jail directory"
+      exit 1
+    fi
+
+    # extract base system into jail
+    echo "[2/5] Installing base system into jail..."
+    tar -xf /usr/freebsd-dist/base.txz -C $JAIL_BASE/$JAIL_NAME 2>/dev/null
+    if [ $? -ne 0 ]; then
+      echo "  WARNING: base.txz not found, creating minimal jail..."
+      mkdir -p $JAIL_BASE/$JAIL_NAME/bin
+      mkdir -p $JAIL_BASE/$JAIL_NAME/etc
+      mkdir -p $JAIL_BASE/$JAIL_NAME/tmp
+      mkdir -p $JAIL_BASE/$JAIL_NAME/var/run
+      mkdir -p $JAIL_BASE/$JAIL_NAME/usr
+    fi
+
+    # apply profile settings
+    echo "[3/5] Applying security profile: $PROFILE..."
+    case "$PROFILE" in
+      web)
+        CPU_LIMIT="50"
+        MEM_LIMIT="512m"
+        ALLOW_NET="yes"
+        ;;
+      database)
+        CPU_LIMIT="70"
+        MEM_LIMIT="1024m"
+        ALLOW_NET="no"
+        ;;
+      cache)
+        CPU_LIMIT="30"
+        MEM_LIMIT="256m"
+        ALLOW_NET="no"
+        ;;
+      bastion)
+        CPU_LIMIT="20"
+        MEM_LIMIT="128m"
+        ALLOW_NET="yes"
+        ;;
+      *)
+        CPU_LIMIT="50"
+        MEM_LIMIT="256m"
+        ALLOW_NET="yes"
+        ;;
+    esac
+
+    # write jail config
+    echo "[4/5] Writing jail configuration..."
+    cat >> $JAIL_CONF << JAILEOF
+
+# SourceBSD jail: $JAIL_NAME (profile: $PROFILE)
+$JAIL_NAME {
+    path = "$JAIL_BASE/$JAIL_NAME";
+    host.hostname = "$JAIL_NAME.sourcebsd";
+    ip4 = inherit;
+    allow.raw_sockets = 0;
+    allow.sysvipc = 0;
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop = "/bin/sh /etc/rc.shutdown";
+    mount.devfs;
+}
+JAILEOF
+
+    # write policy file
+    echo "[5/5] Writing policy file..."
+    mkdir -p /etc/srcbsd/policies
+    cat > /etc/srcbsd/policies/$JAIL_NAME.policy << POLEOF
+# SourceBSD policy file
+# Jail: $JAIL_NAME
+# Profile: $PROFILE
+# Created: $(date)
+
+profile = $PROFILE
+cpu_limit = $CPU_LIMIT
+mem_limit = $MEM_LIMIT
+allow_network = $ALLOW_NET
+allow_raw_sockets = no
+allow_sysvipc = no
+POLEOF
+
+    echo ""
+    echo "==================================="
+    echo " Jail '$JAIL_NAME' created"
+    echo " Profile:  $PROFILE"
+    echo " CPU limit: $CPU_LIMIT%"
+    echo " RAM limit: $MEM_LIMIT"
+    echo " Policy: /etc/srcbsd/policies/$JAIL_NAME.policy"
+    echo "==================================="
+    echo ""
+    echo "To start: jail -c $JAIL_NAME"
+    echo "To delete: srcjail destroy $JAIL_NAME"
+    ;;
+
+  list)
+    echo "==================================="
+    echo " SourceBSD - Active Jails"
+    echo "==================================="
+    jls -v 2>/dev/null
+    echo ""
+    echo "--- Configured jails ---"
+    ls /etc/srcbsd/policies/ 2>/dev/null | sed 's/.policy//' || echo "No jails configured"
+    echo "==================================="
+    ;;
+
+  destroy)
+    if [ -z "$2" ]; then
+      echo "Usage: srcjail destroy <name>"
+      exit 1
+    fi
+    JAIL_NAME="$2"
+    echo "Destroying jail: $JAIL_NAME"
+    jail -r $JAIL_NAME 2>/dev/null
+    rm -rf $JAIL_BASE/$JAIL_NAME
+    rm -f /etc/srcbsd/policies/$JAIL_NAME.policy
+    echo "Jail $JAIL_NAME destroyed."
+    ;;
+
+  *)
+    echo "Usage: srcjail [create|list|destroy]"
+    echo ""
+    echo "Commands:"
+    echo "  create <name> --profile <profile>   Create a new jail"
+    echo "  list                                 List all jails"
+    echo "  destroy <name>                       Remove a jail"
+    echo ""
+    echo "Profiles: web, database, cache, bastion"
+    ;;
+esac
