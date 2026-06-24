@@ -1,0 +1,44 @@
+#!/bin/sh
+# PROVIDE: sourcepanel
+# REQUIRE: NETWORKING flask
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="sourcepanel"
+rcvar="sourcepanel_enable"
+pidfile="/var/run/sourcepanel.pid"
+command="/usr/local/bin/python3.11"
+command_args="/usr/local/sourcepanel/sourcepanel.py"
+
+start_cmd="sourcepanel_start"
+stop_cmd="sourcepanel_stop"
+status_cmd="sourcepanel_status"
+
+sourcepanel_start() {
+    echo "Starting SourcePanel..."
+    /usr/local/bin/python3.11 /usr/local/sourcepanel/sourcepanel.py > /var/log/sourcepanel.log 2>&1 &
+    echo $! > $pidfile
+    echo "SourcePanel started on port 8080"
+}
+
+sourcepanel_stop() {
+    if [ -f $pidfile ]; then
+        kill $(cat $pidfile)
+        rm -f $pidfile
+        echo "SourcePanel stopped."
+    else
+        echo "SourcePanel not running."
+    fi
+}
+
+sourcepanel_status() {
+    if [ -f $pidfile ] && kill -0 $(cat $pidfile) 2>/dev/null; then
+        echo "SourcePanel is running as PID $(cat $pidfile)"
+    else
+        echo "SourcePanel is not running."
+    fi
+}
+
+load_rc_config $name
+run_rc_command "$1"
