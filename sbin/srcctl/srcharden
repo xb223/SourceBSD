@@ -1,0 +1,269 @@
+#!/bin/sh
+# srcharden - SourceBSD host hardening command
+
+LOG_FILE="/var/log/srcharden.log"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+case "$1" in
+  check)
+    echo "==================================="
+    echo " SourceBSD - Hardening Check"
+    echo "==================================="
+    echo ""
+    ISSUES=0
+
+    # securelevel
+    SL=$(sysctl -n kern.securelevel)
+    if [ "$SL" -lt 1 ]; then
+      echo "  [WARN] kern.securelevel = $SL"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.securelevel = $SL"
+    fi
+
+    # coredump
+    CD=$(sysctl -n kern.coredump)
+    if [ "$CD" = "1" ]; then
+      echo "  [WARN] kern.coredump = enabled"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.coredump = disabled"
+    fi
+
+    # randompid
+    RP=$(sysctl -n kern.randompid)
+    if [ "$RP" = "0" ]; then
+      echo "  [WARN] kern.randompid = 0"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.randompid = $RP"
+    fi
+
+    # syslog not exposed
+    SYSLOG=$(sockstat -l 2>/dev/null | grep "udp.*514" | grep -v "127\." | wc -l | tr -d ' ')
+    if [ "$SYSLOG" -gt 0 ]; then
+      echo "  [WARN] syslogd listening on public interface :514"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   syslogd not exposed publicly"
+    fi
+
+    # root login
+    RL=$(grep "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    if [ "$RL" = "yes" ]; then
+      echo "  [WARN] PermitRootLogin = yes"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   PermitRootLogin = ${RL:-default}"
+    fi
+
+    # password auth
+    PA=$(grep "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    if [ "$PA" = "yes" ]; then
+      echo "  [WARN] PasswordAuthentication = yes"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   PasswordAuthentication = ${PA:-default}"
+    fi
+
+    # rctl enabled
+    RACCT=$(sysctl -n kern.racct.enable 2>/dev/null)
+    if [ "$RACCT" != "1" ]; then
+      echo "  [WARN] kern.racct.enable = 0 — rctl disabled"
+      ISSUES=$(( ISSUES + 1 ))
+    else
+      echo "  [OK]   kern.racct.enable = 1"
+    fi
+
+    echo ""
+    echo "==================================="
+    if [ "$ISSUES" -eq 0 ]; then
+      echo " Result: HARDENED — no issues found"
+    else
+      echo " Result: $ISSUES issue(s) found"
+      echo " Run: srcharden apply --level 1"
+    fi
+    echo "==================================="
+    ;;
+
+  apply)
+    LEVEL="1"
+    if [ "$2" = "--level" ] && [ -n "$3" ]; then
+      LEVEL="$3"
+    fi
+
+    echo "==================================="
+    echo " SourceBSD - Applying Hardening"
+    echo " Level: $LEVEL"
+    echo "==================================="
+    echo ""
+
+    # level 1 — basic hardening
+    echo "[ Level 1 — Basic hardening ]"
+
+    echo "  Disabling core dumps..."
+    sysctl kern.coredump=0 > /dev/null
+    echo 'kern.coredump=0' >> /etc/sysctl.conf
+    echo "  [OK] kern.coredump = 0"
+
+    echo "  Enabling random PIDs..."
+    sysctl kern.randompid=1 > /dev/null
+    echo 'kern.randompid=1' >> /etc/sysctl.conf
+    echo "  [OK] kern.randompid = 1"
+
+    echo "  Restricting syslogd to localhost..."
+    sysrc syslogd_flags="-ss" > /dev/null
+    echo "  [OK] syslogd restricted to localhost"
+
+    echo "  Enabling securelevel 1..."
+    sysctl kern.securelevel=1 > /dev/null
+    echo 'kern.securelevel=1' >> /etc/sysctl.conf
+    echo "  [OK] kern.securelevel = 1"
+
+    log "INFO  Level 1 hardening applied"
+
+    if [ "$LEVEL" -ge 2 ] 2>/dev/null; then
+      echo ""
+      echo "[ Level 2 — SSH hardening ]"
+
+      echo "  Disabling SSH password authentication..."
+      sed -i '' 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+      echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+      echo "  [OK] PasswordAuthentication = no"
+
+      echo "  Disabling SSH root login..."
+      sed -i '' 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+      echo "  [OK] PermitRootLogin = no"
+
+      echo "  Restarting sshd..."
+      service sshd restart > /dev/null 2>&1
+      echo "  [OK] sshd restarted"
+
+      log "INFO  Level 2 SSH hardening applied"
+      echo ""
+      echo "  WARNING: Password SSH is now disabled."
+      echo "  Make sure you have an SSH key configured"
+      echo "  before closing this session."
+    fi
+
+    if [ "$LEVEL" -ge 3 ] 2>/dev/null; then
+      echo ""
+      echo "[ Level 3 — Network hardening ]"
+
+      echo "  Disabling ICMP redirects..."
+      sysctl net.inet.ip.redirect=0 > /dev/null
+      echo 'net.inet.ip.redirect=0' >> /etc/sysctl.conf
+      echo "  [OK] ICMP redirects disabled"
+
+      echo "  Enabling SYN flood protection..."
+      sysctl net.inet.tcp.syncookies=1 > /dev/null
+      echo 'net.inet.tcp.syncookies=1' >> /etc/sysctl.conf
+      echo "  [OK] SYN cookies enabled"
+
+      echo "  Disabling IP source routing..."
+      sysctl net.inet.ip.sourceroute=0 > /dev/null
+      echo 'net.inet.ip.sourceroute=0' >> /etc/sysctl.conf
+      echo "  [OK] IP source routing disabled"
+
+      log "INFO  Level 3 network hardening applied"
+    fi
+
+    if [ "$LEVEL" -ge 4 ] 2>/dev/null; then
+      echo ""
+      echo "[ Level 4 — Process hardening ]"
+
+      echo "  Hiding other users processes..."
+      sysctl security.bsd.see_other_uids=0 > /dev/null
+      echo 'security.bsd.see_other_uids=0' >> /etc/sysctl.conf
+      echo "  [OK] Process hiding enabled"
+
+      echo "  Disabling unprivileged process debug..."
+      sysctl security.bsd.unprivileged_proc_debug=0 > /dev/null
+      echo 'security.bsd.unprivileged_proc_debug=0' >> /etc/sysctl.conf
+      echo "  [OK] Unprivileged debug disabled"
+
+      echo "  Restricting dmesg to root..."
+      sysctl security.bsd.unprivileged_read_msgbuf=0 > /dev/null
+      echo 'security.bsd.unprivileged_read_msgbuf=0' >> /etc/sysctl.conf
+      echo "  [OK] dmesg restricted to root"
+
+      log "INFO  Level 4 process hardening applied"
+    fi
+
+    if [ "$LEVEL" -ge 5 ] 2>/dev/null; then
+      echo ""
+      echo "[ Level 5 — Maximum hardening ]"
+
+      echo "  Disabling unprivileged idprio..."
+      sysctl security.bsd.unprivileged_idprio=0 > /dev/null
+      echo 'security.bsd.unprivileged_idprio=0' >> /etc/sysctl.conf
+      echo "  [OK]"
+
+      echo "  Enabling random IP ID..."
+      sysctl net.inet.ip.random_id=1 > /dev/null
+      echo 'net.inet.ip.random_id=1' >> /etc/sysctl.conf
+      echo "  [OK] Random IP ID enabled"
+
+      echo "  Disabling TCP ISN visible..."
+      sysctl net.inet.tcp.isn_reseed_interval=45 > /dev/null
+      echo 'net.inet.tcp.isn_reseed_interval=45' >> /etc/sysctl.conf
+      echo "  [OK] TCP ISN reseeding enabled"
+
+      log "INFO  Level 5 maximum hardening applied"
+    fi
+
+    echo ""
+    echo "==================================="
+    echo " Hardening level $LEVEL applied"
+    echo " Run: srcharden check to verify"
+    echo "==================================="
+    ;;
+
+  revert)
+    echo "==================================="
+    echo " SourceBSD - Reverting Hardening"
+    echo "==================================="
+    echo ""
+    echo "  Removing hardening from /etc/sysctl.conf..."
+    sed -i '' '/kern.coredump=0/d' /etc/sysctl.conf
+    sed -i '' '/kern.randompid=1/d' /etc/sysctl.conf
+    sed -i '' '/kern.securelevel=1/d' /etc/sysctl.conf
+    sed -i '' '/net.inet.ip.redirect=0/d' /etc/sysctl.conf
+    sed -i '' '/net.inet.tcp.syncookies=1/d' /etc/sysctl.conf
+    sed -i '' '/net.inet.ip.sourceroute=0/d' /etc/sysctl.conf
+    sed -i '' '/security.bsd.see_other_uids=0/d' /etc/sysctl.conf
+    sed -i '' '/security.bsd.unprivileged_proc_debug=0/d' /etc/sysctl.conf
+    sed -i '' '/security.bsd.unprivileged_read_msgbuf=0/d' /etc/sysctl.conf
+    sed -i '' '/net.inet.ip.random_id=1/d' /etc/sysctl.conf
+    echo "  [OK] sysctl.conf cleaned"
+
+    echo "  Restoring syslogd..."
+    sysrc syslogd_flags="" > /dev/null
+    echo "  [OK] syslogd restored"
+
+    log "INFO  Hardening reverted"
+    echo ""
+    echo "  Reboot to fully restore defaults."
+    echo "==================================="
+    ;;
+
+  *)
+    echo "Usage: srcharden [check|apply|revert]"
+    echo ""
+    echo "Commands:"
+    echo "  check              Show current hardening status"
+    echo "  apply --level <n>  Apply hardening level 1-5"
+    echo "  revert             Remove all hardening settings"
+    echo ""
+    echo "Levels:"
+    echo "  1 — Basic: coredump, randompid, securelevel, syslogd"
+    echo "  2 — SSH: disable password auth and root login"
+    echo "  3 — Network: ICMP, SYN flood, source routing"
+    echo "  4 — Process: hide procs, restrict debug and dmesg"
+    echo "  5 — Maximum: all of the above plus extra"
+    ;;
+esac
