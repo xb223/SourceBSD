@@ -3,6 +3,7 @@
 
 JAIL_BASE="/jails"
 JAIL_CONF="/etc/jail.conf"
+POLICY_DIR="/etc/srcbsd/policies"
 
 case "$1" in
   create)
@@ -15,7 +16,6 @@ case "$1" in
     JAIL_NAME="$2"
     PROFILE="default"
 
-    # check for --profile flag
     if [ "$3" = "--profile" ] && [ -n "$4" ]; then
       PROFILE="$4"
     fi
@@ -28,16 +28,10 @@ case "$1" in
     echo "==================================="
     echo ""
 
-    # create jail directory
-    echo "[1/5] Creating jail filesystem..."
+    echo "[1/6] Creating jail filesystem..."
     mkdir -p $JAIL_BASE/$JAIL_NAME
-    if [ $? -ne 0 ]; then
-      echo "ERROR: Failed to create jail directory"
-      exit 1
-    fi
 
-    # extract base system into jail
-    echo "[2/5] Installing base system into jail..."
+    echo "[2/6] Installing base system into jail..."
     tar -xf /usr/freebsd-dist/base.txz -C $JAIL_BASE/$JAIL_NAME 2>/dev/null
     if [ $? -ne 0 ]; then
       echo "  WARNING: base.txz not found, creating minimal jail..."
@@ -48,38 +42,16 @@ case "$1" in
       mkdir -p $JAIL_BASE/$JAIL_NAME/usr
     fi
 
-    # apply profile settings
-    echo "[3/5] Applying security profile: $PROFILE..."
+    echo "[3/6] Applying security profile: $PROFILE..."
     case "$PROFILE" in
-      web)
-        CPU_LIMIT="50"
-        MEM_LIMIT="512m"
-        ALLOW_NET="yes"
-        ;;
-      database)
-        CPU_LIMIT="70"
-        MEM_LIMIT="1024m"
-        ALLOW_NET="no"
-        ;;
-      cache)
-        CPU_LIMIT="30"
-        MEM_LIMIT="256m"
-        ALLOW_NET="no"
-        ;;
-      bastion)
-        CPU_LIMIT="20"
-        MEM_LIMIT="128m"
-        ALLOW_NET="yes"
-        ;;
-      *)
-        CPU_LIMIT="50"
-        MEM_LIMIT="256m"
-        ALLOW_NET="yes"
-        ;;
+      web)      CPU_LIMIT="50"; MEM_LIMIT="512m";  ALLOW_NET="yes" ;;
+      database) CPU_LIMIT="70"; MEM_LIMIT="1024m"; ALLOW_NET="no"  ;;
+      cache)    CPU_LIMIT="30"; MEM_LIMIT="256m";  ALLOW_NET="no"  ;;
+      bastion)  CPU_LIMIT="20"; MEM_LIMIT="128m";  ALLOW_NET="yes" ;;
+      *)        CPU_LIMIT="50"; MEM_LIMIT="256m";  ALLOW_NET="yes" ;;
     esac
 
-    # write jail config
-    echo "[4/5] Writing jail configuration..."
+    echo "[4/6] Writing jail configuration..."
     cat >> $JAIL_CONF << JAILEOF
 
 # SourceBSD jail: $JAIL_NAME (profile: $PROFILE)
@@ -95,15 +67,9 @@ $JAIL_NAME {
 }
 JAILEOF
 
-    # write policy file
-    echo "[5/5] Writing policy file..."
-    mkdir -p /etc/srcbsd/policies
-    cat > /etc/srcbsd/policies/$JAIL_NAME.policy << POLEOF
-# SourceBSD policy file
-# Jail: $JAIL_NAME
-# Profile: $PROFILE
-# Created: $(date)
-
+    echo "[5/6] Writing policy file..."
+    mkdir -p $POLICY_DIR
+    cat > $POLICY_DIR/$JAIL_NAME.policy << POLEOF
 profile = $PROFILE
 cpu_limit = $CPU_LIMIT
 mem_limit = $MEM_LIMIT
@@ -112,27 +78,60 @@ allow_raw_sockets = no
 allow_sysvipc = no
 POLEOF
 
+    echo "[6/6] Registering jail for auto-start on boot..."
+    CURRENT_LIST=$(sysrc -n jail_list 2>/dev/null)
+    if echo "$CURRENT_LIST" | grep -qw "$JAIL_NAME"; then
+      echo "  Already in boot list."
+    else
+      sysrc jail_list+=" $JAIL_NAME" > /dev/null
+      echo "  Added to /etc/rc.conf — will start on boot."
+    fi
+
     echo ""
     echo "==================================="
     echo " Jail '$JAIL_NAME' created"
-    echo " Profile:  $PROFILE"
+    echo " Profile:   $PROFILE"
     echo " CPU limit: $CPU_LIMIT%"
     echo " RAM limit: $MEM_LIMIT"
-    echo " Policy: /etc/srcbsd/policies/$JAIL_NAME.policy"
+    echo " Auto-boot: yes"
+    echo " Policy:    $POLICY_DIR/$JAIL_NAME.policy"
     echo "==================================="
-    echo ""
-    echo "To start: jail -c $JAIL_NAME"
-    echo "To delete: srcjail destroy $JAIL_NAME"
+    echo "To start now:  jail -c $JAIL_NAME"
+    echo "To destroy:    srcjail destroy $JAIL_NAME"
     ;;
 
   list)
     echo "==================================="
-    echo " SourceBSD - Active Jails"
+    echo " SourceBSD - Jail Status"
     echo "==================================="
-    jls -v 2>/dev/null
     echo ""
-    echo "--- Configured jails ---"
-    ls /etc/srcbsd/policies/ 2>/dev/null | sed 's/.policy//' || echo "No jails configured"
+    printf "  %-12s %-8s %-6s %-10s %s\n" "NAME" "STATE" "JID" "PROFILE" "AUTO-BOOT"
+    echo "  -----------------------------------------------"
+
+    BOOT_LIST=$(sysrc -n jail_list 2>/dev/null)
+
+    for POLICY in $POLICY_DIR/*.policy; do
+      [ -f "$POLICY" ] || continue
+      JAIL_NAME=$(basename $POLICY .policy)
+      PROFILE=$(grep "^profile" $POLICY | cut -d= -f2 | tr -d ' ')
+      JID=$(jls -j $JAIL_NAME jid 2>/dev/null)
+
+      if [ -n "$JID" ]; then
+        STATE="ACTIVE"
+      else
+        STATE="STOPPED"
+      fi
+
+      if echo "$BOOT_LIST" | grep -qw "$JAIL_NAME"; then
+        AUTOBOOT="yes"
+      else
+        AUTOBOOT="no"
+      fi
+
+      printf "  %-12s %-8s %-6s %-10s %s\n" "$JAIL_NAME" "$STATE" "${JID:--}" "$PROFILE" "$AUTOBOOT"
+    done
+
+    echo ""
     echo "==================================="
     ;;
 
@@ -145,17 +144,40 @@ POLEOF
     echo "Destroying jail: $JAIL_NAME"
     jail -r $JAIL_NAME 2>/dev/null
     rm -rf $JAIL_BASE/$JAIL_NAME
-    rm -f /etc/srcbsd/policies/$JAIL_NAME.policy
-    echo "Jail $JAIL_NAME destroyed."
+    rm -f $POLICY_DIR/$JAIL_NAME.policy
+
+    # remove from boot list
+    CURRENT_LIST=$(sysrc -n jail_list 2>/dev/null)
+    NEW_LIST=$(echo "$CURRENT_LIST" | tr ' ' '\n' | grep -vw "$JAIL_NAME" | tr '\n' ' ' | tr -s ' ')
+    sysrc jail_list="$NEW_LIST" > /dev/null
+    echo "Jail $JAIL_NAME destroyed and removed from boot list."
+    ;;
+
+  start)
+    if [ -z "$2" ]; then
+      echo "Usage: srcjail start <name>"
+      exit 1
+    fi
+    jail -c $2 && echo "jail:$2 started." || echo "Failed to start jail:$2"
+    ;;
+
+  stop)
+    if [ -z "$2" ]; then
+      echo "Usage: srcjail stop <name>"
+      exit 1
+    fi
+    jail -r $2 && echo "jail:$2 stopped." || echo "Failed to stop jail:$2"
     ;;
 
   *)
-    echo "Usage: srcjail [create|list|destroy]"
+    echo "Usage: srcjail [create|list|start|stop|destroy]"
     echo ""
     echo "Commands:"
-    echo "  create <name> --profile <profile>   Create a new jail"
-    echo "  list                                 List all jails"
-    echo "  destroy <name>                       Remove a jail"
+    echo "  create <name> --profile <p>   Create jail and register for auto-boot"
+    echo "  list                           List all jails with status"
+    echo "  start <name>                   Start a stopped jail"
+    echo "  stop <name>                    Stop a running jail"
+    echo "  destroy <name>                 Remove jail completely"
     echo ""
     echo "Profiles: web, database, cache, bastion"
     ;;
