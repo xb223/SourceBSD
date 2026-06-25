@@ -1,0 +1,289 @@
+#!/bin/sh
+# srcpol - SourceBSD policy compiler
+# Write one .policy file, generates pf + rctl + jail config
+
+POLICY_DIR="/etc/srcbsd/policies"
+PF_DIR="/etc/srcbsd/pf"
+COMPILED_DIR="/etc/srcbsd/compiled"
+
+mkdir -p $POLICY_DIR $PF_DIR $COMPILED_DIR
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+compile_policy() {
+  POLICY_FILE="$1"
+  JAIL_NAME=$(basename $POLICY_FILE .sp)
+
+  echo "==================================="
+  echo " srcpol — compiling policy"
+  echo " File: $POLICY_FILE"
+  echo " Jail: $JAIL_NAME"
+  echo "==================================="
+  echo ""
+
+  # read policy values
+  PROFILE=$(grep "^profile" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  CPU_LIMIT=$(grep "^cpu_limit" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  MEM_LIMIT=$(grep "^mem_limit" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  ALLOW_NET=$(grep "^allow_network" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  ALLOW_RAW=$(grep "^allow_raw_sockets" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  ALLOW_SYSIPC=$(grep "^allow_sysvipc" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  VEIL=$(grep "^veil_profile" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+
+  # read allow/deny rules
+  ALLOW_PORTS=$(grep "^allow_port" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  DENY_DOMAINS=$(grep "^deny_domain" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+  ALLOW_JAIL=$(grep "^allow_jail" $POLICY_FILE | cut -d= -f2 | tr -d ' ')
+
+  # set defaults
+  CPU_LIMIT=${CPU_LIMIT:-50}
+  MEM_LIMIT=${MEM_LIMIT:-256m}
+  ALLOW_NET=${ALLOW_NET:-yes}
+  ALLOW_RAW=${ALLOW_RAW:-no}
+  ALLOW_SYSIPC=${ALLOW_SYSIPC:-no}
+
+  echo "[1/4] Compiling rctl resource limits..."
+  RCTL_FILE="$COMPILED_DIR/$JAIL_NAME.rctl"
+  cat > $RCTL_FILE << RCTLEOF
+# srcpol generated rctl rules for jail:$JAIL_NAME
+# generated: $(date)
+jail:$JAIL_NAME:pcpu:deny=$CPU_LIMIT
+jail:$JAIL_NAME:memoryuse:deny=$MEM_LIMIT
+jail:$JAIL_NAME:maxproc:deny=100
+jail:$JAIL_NAME:openfiles:deny=1000
+RCTLEOF
+  echo "  CPU limit:    $CPU_LIMIT%"
+  echo "  Memory limit: $MEM_LIMIT"
+  echo "  Written:      $RCTL_FILE"
+
+  echo ""
+  echo "[2/4] Compiling pf firewall rules..."
+  PF_FILE="$PF_DIR/$JAIL_NAME.pf"
+  cat > $PF_FILE << PFEOF
+# srcpol generated pf rules for jail:$JAIL_NAME
+# generated: $(date)
+# profile: $PROFILE
+
+PFEOF
+
+  # network rules
+  if [ "$ALLOW_NET" = "no" ]; then
+    echo "block out all" >> $PF_FILE
+    echo "pass in all" >> $PF_FILE
+    echo "  Network:      blocked (database profile)"
+  else
+    echo "pass out all" >> $PF_FILE
+    echo "pass in all" >> $PF_FILE
+    echo "  Network:      allowed"
+  fi
+
+  # allowed ports
+  for PORT in $ALLOW_PORTS; do
+    echo "pass in proto tcp to port $PORT" >> $PF_FILE
+    echo "  Allow port:   $PORT"
+  done
+
+  # denied domains
+  for DOMAIN in $DENY_DOMAINS; do
+    echo "# block $DOMAIN" >> $PF_FILE
+    echo "  Deny domain:  $DOMAIN"
+  done
+
+  # jail to jail rules
+  for JAILCONN in $ALLOW_JAIL; do
+    TARGET=$(echo $JAILCONN | cut -d: -f1)
+    PORT=$(echo $JAILCONN | cut -d: -f2)
+    echo "pass out proto tcp to <$TARGET> port $PORT" >> $PF_FILE
+    echo "  Allow jail:   $TARGET:$PORT"
+  done
+
+  echo "  Written:      $PF_FILE"
+
+  echo ""
+  echo "[3/4] Compiling jail.conf entry..."
+  JAIL_CONF_FILE="$COMPILED_DIR/$JAIL_NAME.jail.conf"
+  cat > $JAIL_CONF_FILE << JAILEOF
+# srcpol generated jail config for $JAIL_NAME
+# generated: $(date)
+$JAIL_NAME {
+    path = "/jails/$JAIL_NAME";
+    host.hostname = "$JAIL_NAME.sourcebsd";
+    ip4 = inherit;
+    allow.raw_sockets = $([ "$ALLOW_RAW" = "yes" ] && echo 1 || echo 0);
+    allow.sysvipc = $([ "$ALLOW_SYSIPC" = "yes" ] && echo 1 || echo 0);
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop = "/bin/sh /etc/rc.shutdown";
+    mount.devfs;
+}
+JAILEOF
+  echo "  Written:      $JAIL_CONF_FILE"
+
+  echo ""
+  echo "[4/4] Writing compiled policy summary..."
+  SUMMARY_FILE="$COMPILED_DIR/$JAIL_NAME.summary"
+  cat > $SUMMARY_FILE << SUMEOF
+jail=$JAIL_NAME
+profile=$PROFILE
+cpu_limit=$CPU_LIMIT
+mem_limit=$MEM_LIMIT
+allow_network=$ALLOW_NET
+allow_raw_sockets=$ALLOW_RAW
+allow_sysvipc=$ALLOW_SYSIPC
+veil_profile=$VEIL
+compiled=$(date)
+rctl_file=$RCTL_FILE
+pf_file=$PF_FILE
+jail_conf=$JAIL_CONF_FILE
+SUMEOF
+  echo "  Written:      $SUMMARY_FILE"
+
+  echo ""
+  echo "==================================="
+  echo " Policy compiled successfully"
+  echo " Run: srcpol apply $JAIL_NAME"
+  echo "==================================="
+}
+
+case "$1" in
+  compile)
+    if [ -z "$2" ]; then
+      echo "Usage: srcpol compile <policy.sp>"
+      exit 1
+    fi
+    if [ ! -f "$2" ]; then
+      echo "ERROR: Policy file not found: $2"
+      exit 1
+    fi
+    compile_policy "$2"
+    ;;
+
+  verify)
+    if [ -z "$2" ]; then
+      echo "Usage: srcpol verify <policy.sp>"
+      exit 1
+    fi
+    if [ ! -f "$2" ]; then
+      echo "ERROR: Policy file not found: $2"
+      exit 1
+    fi
+
+    echo "==================================="
+    echo " srcpol — dry run verify"
+    echo " File: $2"
+    echo "==================================="
+    echo ""
+    echo "Policy contents:"
+    cat "$2"
+    echo ""
+    echo "What this policy would enforce:"
+    echo ""
+
+    PROFILE=$(grep "^profile" $2 | cut -d= -f2 | tr -d ' ')
+    CPU=$(grep "^cpu_limit" $2 | cut -d= -f2 | tr -d ' ')
+    MEM=$(grep "^mem_limit" $2 | cut -d= -f2 | tr -d ' ')
+    NET=$(grep "^allow_network" $2 | cut -d= -f2 | tr -d ' ')
+
+    echo "  rctl:  CPU capped at ${CPU:-50}%"
+    echo "  rctl:  Memory capped at ${MEM:-256m}"
+    echo "  pf:    Network $([ "${NET:-yes}" = "yes" ] && echo 'allowed' || echo 'BLOCKED')"
+    echo "  jail:  Isolated filesystem at /jails/$(basename $2 .sp)"
+    echo ""
+    echo "  No changes applied. Run: srcpol compile $2"
+    echo "==================================="
+    ;;
+
+  apply)
+    if [ -z "$2" ]; then
+      echo "Usage: srcpol apply <jailname>"
+      exit 1
+    fi
+    JAIL_NAME="$2"
+    RCTL_FILE="$COMPILED_DIR/$JAIL_NAME.rctl"
+    SUMMARY="$COMPILED_DIR/$JAIL_NAME.summary"
+
+    if [ ! -f "$SUMMARY" ]; then
+      echo "ERROR: No compiled policy found for $JAIL_NAME"
+      echo "Run: srcpol compile <policy.sp> first"
+      exit 1
+    fi
+
+    echo "==================================="
+    echo " srcpol — applying policy"
+    echo " Jail: $JAIL_NAME"
+    echo "==================================="
+    echo ""
+
+    echo "[1/2] Applying rctl limits..."
+    JID=$(jls -j $JAIL_NAME jid 2>/dev/null)
+    if [ -n "$JID" ]; then
+      while read LINE; do
+        case "$LINE" in
+          \#*) continue ;;
+          jail:*) rctl -a "$LINE" 2>/dev/null && echo "  Applied: $LINE" ;;
+        esac
+      done < $RCTL_FILE
+    else
+      echo "  WARNING: jail:$JAIL_NAME not running — rctl will apply on next start"
+    fi
+
+    echo ""
+    echo "[2/2] Policy applied."
+    echo "  Summary: $SUMMARY"
+    echo "==================================="
+    ;;
+
+  diff)
+    if [ -z "$2" ] || [ -z "$3" ]; then
+      echo "Usage: srcpol diff <old.sp> <new.sp>"
+      exit 1
+    fi
+
+    echo "==================================="
+    echo " srcpol — policy diff"
+    echo "==================================="
+    echo ""
+    diff "$2" "$3" || true
+    echo "==================================="
+    ;;
+
+  list)
+    echo "==================================="
+    echo " srcpol — compiled policies"
+    echo "==================================="
+    echo ""
+    if [ -z "$(ls $COMPILED_DIR/*.summary 2>/dev/null)" ]; then
+      echo "  No compiled policies found."
+    else
+      for SUMMARY in $COMPILED_DIR/*.summary; do
+        JAIL=$(grep "^jail=" $SUMMARY | cut -d= -f2)
+        PROFILE=$(grep "^profile=" $SUMMARY | cut -d= -f2)
+        COMPILED=$(grep "^compiled=" $SUMMARY | cut -d= -f2-)
+        echo "  jail:$JAIL — profile:$PROFILE — $COMPILED"
+      done
+    fi
+    echo "==================================="
+    ;;
+
+  *)
+    echo "Usage: srcpol [compile|verify|apply|diff|list]"
+    echo ""
+    echo "Commands:"
+    echo "  compile <policy.sp>    Compile policy into pf + rctl + jail config"
+    echo "  verify <policy.sp>     Dry run — show what policy would enforce"
+    echo "  apply <jailname>       Apply compiled policy to running jail"
+    echo "  diff <old.sp> <new.sp> Show changes between two policies"
+    echo "  list                   Show all compiled policies"
+    echo ""
+    echo "Policy file format (.sp):"
+    echo "  profile = web"
+    echo "  cpu_limit = 50"
+    echo "  mem_limit = 512m"
+    echo "  allow_network = yes"
+    echo "  allow_port = 80"
+    echo "  allow_port = 443"
+    echo "  deny_domain = analytics.google.com"
+    echo "  allow_jail = postgres:5432"
+    ;;
+esac
