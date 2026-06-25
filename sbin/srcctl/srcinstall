@@ -338,7 +338,7 @@ case "$1" in
     echo "  System:      $HOSTNAME"
     echo "  Timezone:    $TZ"
     echo "  Hardening:   Level $HARDEN_LEVEL"
-    echo "  SourcePanel: http://$(hostname):8080"
+    echo "  SourcePanel: http://localhost:8080"
     echo ""
     echo "  Useful commands:"
     echo "    srcctl status       — system health"
