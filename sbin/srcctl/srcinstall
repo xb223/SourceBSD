@@ -1,0 +1,361 @@
+#!/bin/sh
+# srcinstall - SourceBSD Installation Wizard
+# Run: install or setup to begin
+
+MIRROR="https://download.freebsd.org/releases/amd64/amd64/14.4-RELEASE"
+LOG="/var/log/srcinstall.log"
+SRCBSD_VERSION="1.0-CURRENT"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG
+}
+
+banner() {
+  clear
+  echo ""
+  echo "  ███████╗ ██████╗ ██╗   ██╗██████╗  ██████╗███████╗██████╗ ███████╗██████╗ "
+  echo "  ██╔════╝██╔═══██╗██║   ██║██╔══██╗██╔════╝██╔════╝██╔══██╗██╔════╝██╔══██╗"
+  echo "  ███████╗██║   ██║██║   ██║██████╔╝██║     █████╗  ██████╔╝███████╗██║  ██║"
+  echo "  ╚════██║██║   ██║██║   ██║██╔══██╗██║     ██╔══╝  ██╔══██╗╚════██║██║  ██║"
+  echo "  ███████║╚██████╔╝╚██████╔╝██║  ██║╚██████╗███████╗██████╔╝███████║██████╔╝"
+  echo "  ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚══════╝╚═════╝ ╚══════╝╚═════╝ "
+  echo ""
+  echo "  Version: $SRCBSD_VERSION"
+  echo "  A hardened FreeBSD fork for servers and homelabs"
+  echo "  =================================================================="
+  echo ""
+}
+
+confirm() {
+  echo "$1 [y/n]: "
+  read ANSWER
+  case "$ANSWER" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+press_enter() {
+  echo ""
+  echo "  Press Enter to continue..."
+  read DUMMY
+}
+
+step() {
+  echo ""
+  echo "  [$1/8] $2"
+  echo "  ------------------------------------------------------------------"
+}
+
+# check mirror connectivity
+check_mirror() {
+  echo "  Checking mirror connectivity..."
+  fetch -q -o /dev/null $MIRROR/MANIFEST 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "  [OK] Connected to FreeBSD mirror"
+    return 0
+  else
+    echo "  [WARN] Cannot reach mirror — continuing offline"
+    return 1
+  fi
+}
+
+case "$1" in
+  install|setup|"")
+
+    banner
+
+    echo "  Welcome to SourceBSD $SRCBSD_VERSION installation."
+    echo ""
+    echo "  This wizard will:"
+    echo "    1. Set hostname"
+    echo "    2. Set root password"
+    echo "    3. Configure network"
+    echo "    4. Configure timezone"
+    echo "    5. Apply base hardening"
+    echo "    6. Install base packages"
+    echo "    7. Create first jail"
+    echo "    8. Start SourcePanel"
+    echo ""
+    echo "  =================================================================="
+
+    if ! confirm "  Begin installation?"; then
+      echo "  Installation cancelled."
+      exit 0
+    fi
+
+    log "INFO  SourceBSD installation started"
+
+    # step 1 - hostname
+    step 1 "Hostname"
+    echo ""
+    echo "  Enter hostname for this system."
+    echo "  Example: server1.home, nas.local, vpn.example.com"
+    echo ""
+    printf "  Hostname: "
+    read HOSTNAME
+    HOSTNAME=${HOSTNAME:-sourcebsd}
+    hostname $HOSTNAME
+    sysrc hostname="$HOSTNAME" > /dev/null
+    echo "  [OK] Hostname set to: $HOSTNAME"
+    log "INFO  Hostname set: $HOSTNAME"
+
+    press_enter
+
+    # step 2 - root password
+    step 2 "Root Password"
+    echo ""
+    echo "  Set a strong root password."
+    echo "  Default password 'toor' must be changed."
+    echo ""
+    passwd root
+    log "INFO  Root password changed"
+
+    press_enter
+
+    # step 3 - network
+    step 3 "Network Configuration"
+    echo ""
+    echo "  Current network interfaces:"
+    ifconfig | grep "^[a-z]" | grep -v "^lo"
+    echo ""
+    echo "  Network mode:"
+    echo "    1) DHCP (automatic - recommended)"
+    echo "    2) Static IP (manual)"
+    echo ""
+    printf "  Choice [1]: "
+    read NET_CHOICE
+    NET_CHOICE=${NET_CHOICE:-1}
+
+    case "$NET_CHOICE" in
+      2)
+        printf "  IP address: "
+        read STATIC_IP
+        printf "  Netmask [255.255.255.0]: "
+        read NETMASK
+        NETMASK=${NETMASK:-255.255.255.0}
+        printf "  Gateway: "
+        read GATEWAY
+        printf "  DNS server [8.8.8.8]: "
+        read DNS
+        DNS=${DNS:-8.8.8.8}
+
+        IFACE=$(ifconfig | grep "^[a-z]" | grep -v "^lo" | head -1 | cut -d: -f1)
+        sysrc ifconfig_${IFACE}="inet $STATIC_IP netmask $NETMASK" > /dev/null
+        sysrc defaultrouter="$GATEWAY" > /dev/null
+        echo "nameserver $DNS" > /etc/resolv.conf
+        service netif restart > /dev/null 2>&1
+        echo "  [OK] Static IP configured: $STATIC_IP"
+        log "INFO  Static IP: $STATIC_IP"
+        ;;
+      *)
+        IFACE=$(ifconfig | grep "^[a-z]" | grep -v "^lo" | head -1 | cut -d: -f1)
+        sysrc ifconfig_${IFACE}="DHCP" > /dev/null
+        echo "  [OK] DHCP enabled on $IFACE"
+        log "INFO  DHCP enabled on $IFACE"
+        ;;
+    esac
+
+    check_mirror
+    press_enter
+
+    # step 4 - timezone
+    step 4 "Timezone"
+    echo ""
+    echo "  Common timezones:"
+    echo "    1) UTC (recommended for servers)"
+    echo "    2) America/New_York"
+    echo "    3) America/Los_Angeles"
+    echo "    4) Europe/London"
+    echo "    5) Europe/Paris"
+    echo "    6) Asia/Bangkok"
+    echo "    7) Asia/Tokyo"
+    echo "    8) Asia/Singapore"
+    echo "    9) Enter manually"
+    echo ""
+    printf "  Choice [1]: "
+    read TZ_CHOICE
+    TZ_CHOICE=${TZ_CHOICE:-1}
+
+    case "$TZ_CHOICE" in
+      1) TZ="UTC" ;;
+      2) TZ="America/New_York" ;;
+      3) TZ="America/Los_Angeles" ;;
+      4) TZ="Europe/London" ;;
+      5) TZ="Europe/Paris" ;;
+      6) TZ="Asia/Bangkok" ;;
+      7) TZ="Asia/Tokyo" ;;
+      8) TZ="Asia/Singapore" ;;
+      9)
+        printf "  Timezone: "
+        read TZ
+        ;;
+      *) TZ="UTC" ;;
+    esac
+
+    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+      cp /usr/share/zoneinfo/$TZ /etc/localtime
+      echo "  [OK] Timezone set to: $TZ"
+      log "INFO  Timezone: $TZ"
+    else
+      echo "  [WARN] Timezone not found, using UTC"
+      cp /usr/share/zoneinfo/UTC /etc/localtime
+    fi
+
+    press_enter
+
+    # step 5 - hardening
+    step 5 "Base Security Hardening"
+    echo ""
+    echo "  SourceBSD will apply security hardening."
+    echo ""
+    echo "  Hardening levels:"
+    echo "    1) Basic   — coredump, randompid, securelevel (recommended)"
+    echo "    2) Standard — basic + SSH key enforcement"
+    echo "    3) Full    — standard + network + process hardening"
+    echo ""
+    printf "  Level [2]: "
+    read HARDEN_LEVEL
+    HARDEN_LEVEL=${HARDEN_LEVEL:-2}
+
+    echo ""
+    srcharden apply --level $HARDEN_LEVEL
+    log "INFO  Hardening level $HARDEN_LEVEL applied"
+
+    press_enter
+
+    # step 6 - packages
+    step 6 "Base Package Installation"
+    echo ""
+    echo "  Installing SourceBSD base packages..."
+    echo ""
+
+    pkg update -q 2>/dev/null
+    echo "  [1/4] Installing git..."
+    timeout 60 pkg install -y git > /dev/null 2>&1 && echo "  [OK] git" || echo "  [SKIP] git"
+
+    echo "  [2/4] Installing tmux..."
+    timeout 60 pkg install -y tmux > /dev/null 2>&1 && echo "  [OK] tmux" || echo "  [SKIP] tmux"
+
+    echo "  [3/4] Installing nano..."
+    timeout 60 pkg install -y nano > /dev/null 2>&1 && echo "  [OK] nano" || echo "  [SKIP] nano"
+
+    echo "  [4/4] Installing python311..."
+    timeout 60 pkg install -y python311 > /dev/null 2>&1 && echo "  [OK] python311" || echo "  [SKIP] python311"
+
+    log "INFO  Base packages installed"
+    press_enter
+
+    # step 7 - first jail
+    step 7 "First Jail Setup"
+    echo ""
+    echo "  SourceBSD runs services in isolated jails."
+    echo ""
+    echo "  Create a jail now?"
+    echo "    1) Web server jail (nginx)"
+    echo "    2) Database jail (PostgreSQL)"
+    echo "    3) Skip for now"
+    echo ""
+    printf "  Choice [1]: "
+    read JAIL_CHOICE
+    JAIL_CHOICE=${JAIL_CHOICE:-1}
+
+    echo ""
+    case "$JAIL_CHOICE" in
+      1)
+        echo "  Creating web server jail..."
+
+        # check if base.txz exists
+        if [ ! -f "/usr/freebsd-dist/base.txz" ]; then
+          echo "  Downloading base.txz from mirror..."
+          mkdir -p /usr/freebsd-dist
+          fetch --progress -o /usr/freebsd-dist/base.txz $MIRROR/base.txz
+        fi
+
+        srcjail create webjail --profile web
+        jail -c webjail 2>/dev/null
+        cp /etc/resolv.conf /jails/webjail/etc/resolv.conf
+        timeout 120 jexec webjail pkg install -y nginx > /dev/null 2>&1
+        jexec webjail sysrc nginx_enable="YES" > /dev/null
+        jexec webjail service nginx start > /dev/null 2>&1
+        echo "  [OK] nginx jail created and running"
+        log "INFO  webjail created with nginx"
+        ;;
+      2)
+        echo "  Creating database jail..."
+        if [ ! -f "/usr/freebsd-dist/base.txz" ]; then
+          echo "  Downloading base.txz from mirror..."
+          mkdir -p /usr/freebsd-dist
+          fetch --progress -o /usr/freebsd-dist/base.txz $MIRROR/base.txz
+        fi
+        srcjail create dbjail --profile database
+        echo "  [OK] database jail created"
+        log "INFO  dbjail created"
+        ;;
+      *)
+        echo "  Skipping jail setup."
+        ;;
+    esac
+
+    press_enter
+
+    # step 8 - sourcepanel
+    step 8 "SourcePanel Web Control Plane"
+    echo ""
+    echo "  SourcePanel is the web UI for managing SourceBSD."
+    echo "  It runs on port 8080 and shows live system data."
+    echo ""
+
+    if confirm "  Install SourcePanel?"; then
+      echo ""
+      echo "  Installing Flask..."
+      pkg install -y py311-flask > /dev/null 2>&1
+
+      mkdir -p /usr/local/sourcepanel
+
+      echo "  Downloading SourcePanel..."
+      fetch -q -o /usr/local/sourcepanel/sourcepanel.py \
+        https://raw.githubusercontent.com/xb223/SourceBSD/master/sourcepanel/sourcepanel.py 2>/dev/null
+
+      if [ ! -s /usr/local/sourcepanel/sourcepanel.py ]; then
+        echo "  [WARN] Could not download SourcePanel — skipping"
+      else
+        chmod +x /usr/local/sourcepanel/sourcepanel.py
+        /usr/local/bin/python3.11 /usr/local/sourcepanel/sourcepanel.py > /var/log/sourcepanel.log 2>&1 &
+        echo "  [OK] SourcePanel running at http://$(hostname -s):8080"
+        log "INFO  SourcePanel installed and started"
+      fi
+    fi
+
+    # done
+    clear
+    banner
+
+    echo "  =================================================================="
+    echo "  Installation Complete!"
+    echo "  =================================================================="
+    echo ""
+    echo "  System:      $HOSTNAME"
+    echo "  Timezone:    $TZ"
+    echo "  Hardening:   Level $HARDEN_LEVEL"
+    echo "  SourcePanel: http://$(hostname):8080"
+    echo ""
+    echo "  Useful commands:"
+    echo "    srcctl status       — system health"
+    echo "    srcjail list        — jail status"
+    echo "    srcaudit check      — security audit"
+    echo "    srcharden check     — hardening status"
+    echo "    srcwatch start      — start anomaly detection"
+    echo ""
+    echo "  Documentation: https://github.com/xb223/SourceBSD"
+    echo ""
+    echo "  =================================================================="
+    echo ""
+    log "INFO  Installation completed successfully"
+    ;;
+
+  *)
+    echo "Usage: srcinstall [install|setup]"
+    echo "       Type 'install' or 'setup' to begin"
+    ;;
+esac
