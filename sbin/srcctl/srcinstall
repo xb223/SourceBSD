@@ -63,6 +63,12 @@ check_mirror() {
 case "$1" in
   install|setup|"")
 
+    # lower securelevel for installation
+    sed -i '' '/kern.securelevel/d' /etc/sysctl.conf 2>/dev/null
+    sysctl kern.securelevel=0 2>/dev/null || true
+
+
+
     banner
 
     echo "  Welcome to SourceBSD $SRCBSD_VERSION installation."
